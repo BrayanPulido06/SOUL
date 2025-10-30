@@ -13,7 +13,7 @@ EXPORTS_DIR.mkdir(exist_ok=True)
 # Configuración de base de datos
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@db:5432/registros_db")
 
-# Estudios disponibles
+# Estudios disponibles (ACTUALIZADO para coincidir con frontend)
 ESTUDIOS_DISPONIBLES = [
     'Desarrollo Web',
     'Desarrollo Móvil',

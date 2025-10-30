@@ -1,7 +1,7 @@
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from datetime import datetime
 from pathlib import Path
 from app.config import EXPORTS_DIR, ESTUDIOS_DISPONIBLES
@@ -70,19 +70,76 @@ class ExcelHandler:
         return filepath
     
     @staticmethod
-    def import_from_excel(filepath: Path) -> tuple[List[Dict], List[str]]:
+    def get_sheet_names(filepath: Path) -> List[str]:
         """
-        Importa registros desde un archivo Excel
+        Obtiene los nombres de todas las hojas del archivo Excel
         
         Args:
             filepath: Ruta del archivo Excel
             
         Returns:
+            Lista con nombres de las hojas
+        """
+        try:
+            wb = load_workbook(filepath, read_only=True, data_only=True)
+            sheet_names = wb.sheetnames
+            wb.close()
+            return sheet_names
+        except Exception as e:
+            return []
+    
+    @staticmethod
+    def import_from_excel_multiple_sheets(filepath: Path, sheet_names: List[str] = None) -> Dict[str, Tuple[List[Dict], List[str]]]:
+        """
+        Importa registros desde múltiples hojas de un archivo Excel
+        
+        Args:
+            filepath: Ruta del archivo Excel
+            sheet_names: Lista de nombres de hojas a importar (None = todas)
+            
+        Returns:
+            Diccionario con {nombre_hoja: (registros_válidos, errores)}
+        """
+        try:
+            # Obtener todas las hojas disponibles
+            xl_file = pd.ExcelFile(filepath)
+            available_sheets = xl_file.sheet_names
+            
+            # Si no se especifican hojas, importar todas
+            if not sheet_names:
+                sheet_names = available_sheets
+            
+            results = {}
+            
+            for sheet_name in sheet_names:
+                if sheet_name not in available_sheets:
+                    results[sheet_name] = ([], [f"La hoja '{sheet_name}' no existe en el archivo"])
+                    continue
+                
+                # Procesar cada hoja
+                registros, errores = ExcelHandler._process_sheet(filepath, sheet_name)
+                results[sheet_name] = (registros, errores)
+            
+            return results
+            
+        except Exception as e:
+            return {"error": ([], [f"Error al leer el archivo Excel: {str(e)}"])}
+    
+    @staticmethod
+    def _process_sheet(filepath: Path, sheet_name: str) -> Tuple[List[Dict], List[str]]:
+        """
+        Procesa una hoja específica del Excel
+        
+        Args:
+            filepath: Ruta del archivo Excel
+            sheet_name: Nombre de la hoja
+            
+        Returns:
             Tupla con (registros_válidos, errores)
         """
         try:
-            # Leer Excel
-            df = pd.read_excel(filepath)
+            # Leer hoja específica
+            df = pd.read_excel(filepath, sheet_name=sheet_name)
             
             # Mapeo de columnas (flexible para diferentes formatos)
             column_mapping = {
@@ -108,7 +165,7 @@ class ExcelHandler:
             missing_fields = [field for field in required_fields if field not in mapped_columns]
             
             if missing_fields:
-                return [], [f"Faltan las siguientes columnas requeridas: {', '.join(missing_fields)}"]
+                return [], [f"Hoja '{sheet_name}': Faltan columnas: {', '.join(missing_fields)}"]
             
             # Renombrar columnas
             df = df.rename(columns={v: k for k, v in mapped_columns.items()})
@@ -117,7 +174,7 @@ class ExcelHandler:
             df = df[required_fields]
             
             # Limpiar datos
-            df = df.dropna(subset=required_fields)  # Eliminar filas con valores nulos
+            df = df.dropna(subset=required_fields)
             df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
             
             registros_validos = []
@@ -126,18 +183,18 @@ class ExcelHandler:
             for idx, row in df.iterrows():
                 try:
                     # Validar estudio
-                    estudio = row['estudio']
+                    estudio = str(row['estudio']).strip()
                     if estudio not in ESTUDIOS_DISPONIBLES:
                         errores.append(
-                            f"Fila {idx + 2}: Estudio '{estudio}' no válido. "
-                            f"Debe ser uno de: {', '.join(ESTUDIOS_DISPONIBLES)}"
+                            f"Hoja '{sheet_name}', Fila {idx + 2}: Estudio '{estudio}' no válido. "
+                            f"Debe ser: {', '.join(ESTUDIOS_DISPONIBLES)}"
                         )
                         continue
                     
                     # Validar email básico
-                    email = str(row['email']).strip()
+                    email = str(row['email']).strip().lower()
                     if '@' not in email or '.' not in email:
-                        errores.append(f"Fila {idx + 2}: Email '{email}' no válido")
+                        errores.append(f"Hoja '{sheet_name}', Fila {idx + 2}: Email '{email}' no válido")
                         continue
                     
                     registro = {
@@ -150,12 +207,25 @@ class ExcelHandler:
                     registros_validos.append(registro)
                     
                 except Exception as e:
-                    errores.append(f"Fila {idx + 2}: Error al procesar - {str(e)}")
+                    errores.append(f"Hoja '{sheet_name}', Fila {idx + 2}: Error - {str(e)}")
             
             return registros_validos, errores
             
         except Exception as e:
-            return [], [f"Error al leer el archivo Excel: {str(e)}"]
+            return [], [f"Error al procesar hoja '{sheet_name}': {str(e)}"]
+    
+    @staticmethod
+    def import_from_excel(filepath: Path) -> Tuple[List[Dict], List[str]]:
+        """
+        Importa registros desde un archivo Excel (solo primera hoja - retrocompatibilidad)
+        
+        Args:
+            filepath: Ruta del archivo Excel
+            
+        Returns:
+            Tupla con (registros_válidos, errores)
+        """
+        return ExcelHandler._process_sheet(filepath, 0)
     
     @staticmethod
     def create_template() -> Path:
@@ -173,11 +243,11 @@ class ExcelHandler:
         ws.title = "Plantilla Registros"
         
         # Encabezados
-        headers = ["nombres", "apellidos", "email", "estudio"]
+        headers = ["Nombres", "Apellidos", "Email", "Estudio"]
         ws.append(headers)
         
         # Estilo de encabezados
-        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_fill = PatternFill(start_color="39a900", end_color="39a900", fill_type="solid")
         header_font = Font(bold=True, color="FFFFFF")
         
         for cell in ws[1]:
@@ -187,9 +257,9 @@ class ExcelHandler:
         
         # Agregar ejemplos
         ejemplos = [
-            ["Juan", "Pérez", "juan.perez@example.com", "Desarrollo Web"],
-            ["María", "González", "maria.gonzalez@example.com", "Diseño Gráfico"],
-            ["Carlos", "López", "carlos.lopez@example.com", "Bases de Datos"]
+            ["Juan Carlos", "Pérez García", "juan.perez@example.com", "Técnico"],
+            ["María José", "González López", "maria.gonzalez@example.com", "Tecnólogo"],
+            ["Carlos Alberto", "Rodríguez Martínez", "carlos.rodriguez@example.com", "Especialización"]
         ]
         
         for ejemplo in ejemplos:

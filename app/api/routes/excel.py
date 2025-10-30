@@ -1,10 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
+from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Body
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from pathlib import Path
 import shutil
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from app.api.deps import get_db
 from app.models.registro import Registro
@@ -22,7 +22,7 @@ async def descargar_plantilla():
         
         return FileResponse(
             path=filepath,
-            filename="plantilla_registros.xlsx",
+            filename="plantilla_registros_sena.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     except Exception as e:
@@ -37,7 +37,6 @@ async def exportar_registros(
     try:
         query = db.query(Registro)
         
-        # Filtrar por estudio si se proporciona
         if estudio:
             query = query.filter(Registro.estudio == estudio)
         
@@ -46,7 +45,6 @@ async def exportar_registros(
         if not registros:
             raise HTTPException(status_code=404, detail="No hay registros para exportar")
         
-        # Convertir a diccionarios
         registros_data = []
         for registro in registros:
             registros_data.append({
@@ -58,9 +56,8 @@ async def exportar_registros(
                 'fecha_registro': registro.fecha_registro
             })
         
-        # Generar archivo Excel
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"registros_export_{timestamp}.xlsx"
+        filename = f"registros_sena_{timestamp}.xlsx"
         filepath = ExcelHandler.export_to_excel(registros_data, filename)
         
         return FileResponse(
@@ -76,11 +73,15 @@ async def exportar_registros(
 @router.post("/excel/importar", response_model=ResponseModel)
 async def importar_registros(
     file: UploadFile = File(...),
+    sheet_names: Optional[str] = None,  # Nombres de hojas separados por coma
     db: Session = Depends(get_db)
 ):
-    """Importar registros desde un archivo Excel"""
+    """
+    Importar registros desde un archivo Excel
+    Puede procesar múltiples hojas si se especifica sheet_names
+    """
     
-    # Validar extensión del archivo
+    # Validar extensión
     file_extension = Path(file.filename).suffix.lower()
     if file_extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -88,7 +89,7 @@ async def importar_registros(
             detail=f"Tipo de archivo no permitido. Use: {', '.join(ALLOWED_EXTENSIONS)}"
         )
     
-    # Validar tamaño del archivo
+    # Validar tamaño
     file.file.seek(0, 2)
     file_size = file.file.tell()
     file.file.seek(0)
@@ -109,55 +110,78 @@ async def importar_registros(
         with temp_filepath.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Importar datos
-        registros_validos, errores = ExcelHandler.import_from_excel(temp_filepath)
+        # Procesar hojas especificadas o todas
+        sheets_to_process = None
+        if sheet_names:
+            sheets_to_process = [s.strip() for s in sheet_names.split(',')]
         
-        # Procesar registros válidos
-        registros_creados = []
-        registros_duplicados = []
-        errores_db = []
+        # Importar desde múltiples hojas
+        results_by_sheet = ExcelHandler.import_from_excel_multiple_sheets(
+            temp_filepath,
+            sheets_to_process
+        )
         
-        for registro_data in registros_validos:
-            try:
-                # Verificar si el email ya existe
-                existing = db.query(Registro).filter(
-                    Registro.email == registro_data['email']
-                ).first()
-                
-                if existing:
-                    registros_duplicados.append(registro_data['email'])
-                    continue
-                
-                # Crear registro
-                nuevo_registro = Registro(**registro_data)
-                db.add(nuevo_registro)
-                db.flush()
-                
-                registros_creados.append(RegistroResponse.from_orm(nuevo_registro))
-                
-            except Exception as e:
-                errores_db.append(f"Error al guardar {registro_data['email']}: {str(e)}")
+        # Procesar todos los registros de todas las hojas
+        total_registros_creados = []
+        total_registros_duplicados = []
+        total_errores = []
+        sheets_processed = {}
+        
+        for sheet_name, (registros_validos, errores) in results_by_sheet.items():
+            registros_creados_hoja = []
+            duplicados_hoja = []
+            errores_db_hoja = []
+            
+            for registro_data in registros_validos:
+                try:
+                    # Verificar duplicado
+                    existing = db.query(Registro).filter(
+                        Registro.email == registro_data['email']
+                    ).first()
+                    
+                    if existing:
+                        duplicados_hoja.append(registro_data['email'])
+                        continue
+                    
+                    # Crear registro
+                    nuevo_registro = Registro(**registro_data)
+                    db.add(nuevo_registro)
+                    db.flush()
+                    
+                    registros_creados_hoja.append(RegistroResponse.from_orm(nuevo_registro))
+                    
+                except Exception as e:
+                    errores_db_hoja.append(f"{registro_data['email']}: {str(e)}")
+            
+            # Guardar estadísticas por hoja
+            sheets_processed[sheet_name] = {
+                "procesados": len(registros_validos),
+                "creados": len(registros_creados_hoja),
+                "duplicados": len(duplicados_hoja),
+                "errores": len(errores) + len(errores_db_hoja)
+            }
+            
+            total_registros_creados.extend(registros_creados_hoja)
+            total_registros_duplicados.extend(duplicados_hoja)
+            total_errores.extend(errores)
+            total_errores.extend(errores_db_hoja)
         
         # Commit si hay registros creados
-        if registros_creados:
+        if total_registros_creados:
             db.commit()
         
-        # Preparar respuesta
-        total_procesados = len(registros_validos)
-        total_creados = len(registros_creados)
-        total_duplicados = len(registros_duplicados)
-        total_errores = len(errores) + len(errores_db)
+        # Preparar mensaje
+        total_creados = len(total_registros_creados)
+        total_duplicados = len(total_registros_duplicados)
+        total_err = len(total_errores)
         
         mensaje_partes = []
-        
         if total_creados > 0:
-            mensaje_partes.append(f"{total_creados} registro(s) importado(s) exitosamente")
-        
+            mensaje_partes.append(f"{total_creados} registro(s) importado(s)")
         if total_duplicados > 0:
-            mensaje_partes.append(f"{total_duplicados} registro(s) duplicado(s)")
-        
-        if total_errores > 0:
-            mensaje_partes.append(f"{total_errores} error(es) encontrado(s)")
+            mensaje_partes.append(f"{total_duplicados} duplicado(s)")
+        if total_err > 0:
+            mensaje_partes.append(f"{total_err} error(es)")
         
         mensaje = ". ".join(mensaje_partes) if mensaje_partes else "No se procesaron registros"
         
@@ -165,12 +189,13 @@ async def importar_registros(
             "success": total_creados > 0,
             "message": mensaje,
             "data": {
-                "registros_creados": registros_creados,
-                "total_procesados": total_procesados,
+                "registros_creados": total_registros_creados,
                 "total_creados": total_creados,
                 "total_duplicados": total_duplicados,
-                "emails_duplicados": registros_duplicados,
-                "errores": errores + errores_db
+                "emails_duplicados": total_registros_duplicados,
+                "errores": total_errores[:10],  # Solo primeros 10 errores
+                "total_errores": total_err,
+                "hojas_procesadas": sheets_processed
             }
         }
         
